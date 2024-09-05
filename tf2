@@ -1,0 +1,105 @@
+import tensorflow as tf
+import numpy as np
+from sklearn.metrics import accuracy_score
+from utils import train_test_divide, extract_time, batch_generator
+
+def discriminative_score_metrics(ori_data, generated_data):
+    """Use post-hoc RNN to classify original data and synthetic data
+    
+    Args:
+      - ori_data: original data
+      - generated_data: generated synthetic data
+      
+    Returns:
+      - discriminative_score: np.abs(classification accuracy - 0.5)
+    """
+    
+    # Basic Parameters
+    no, seq_len, dim = np.asarray(ori_data).shape    
+    
+    # Set maximum sequence length and each sequence length
+    ori_time, ori_max_seq_len = extract_time(ori_data)
+    generated_time, generated_max_seq_len = extract_time(ori_data)
+    max_seq_len = max([ori_max_seq_len, generated_max_seq_len])  
+    
+    # Network parameters
+    hidden_dim = int(dim / 2)
+    iterations = 2000
+    batch_size = 128
+
+    # Input placeholders are now directly tensors in TensorFlow 2.x
+    X = tf.keras.Input(shape=(max_seq_len, dim), name="input_x")
+    X_hat = tf.keras.Input(shape=(max_seq_len, dim), name="input_x_hat")
+    
+    T = tf.keras.Input(shape=(), dtype=tf.int32, name="input_t")
+    T_hat = tf.keras.Input(shape=(), dtype=tf.int32, name="input_t_hat")
+
+    # discriminator function
+    def discriminator(x, t):
+        """Simple discriminator function.
+        
+        Args:
+          - x: time-series data
+          - t: time information
+          
+        Returns:
+          - y_hat_logit: logits of the discriminator output
+          - y_hat: discriminator output
+          - d_vars: discriminator variables
+        """
+        gru_layer = tf.keras.layers.GRU(hidden_dim, activation='tanh', return_sequences=False)
+        d_outputs = gru_layer(x, mask=tf.sequence_mask(t, maxlen=max_seq_len))
+        
+        y_hat_logit = tf.keras.layers.Dense(1)(d_outputs)
+        y_hat = tf.keras.activations.sigmoid(y_hat_logit)
+        
+        return y_hat_logit, y_hat
+
+    y_logit_real, y_pred_real = discriminator(X, T)
+    y_logit_fake, y_pred_fake = discriminator(X_hat, T_hat)
+
+    # Loss for the discriminator
+    d_loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=y_logit_real, labels=tf.ones_like(y_logit_real)))
+    d_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=y_logit_fake, labels=tf.zeros_like(y_logit_fake)))
+    d_loss = d_loss_real + d_loss_fake
+
+    # Define optimizer
+    optimizer = tf.keras.optimizers.Adam()
+
+    # Training step
+    @tf.function
+    def train_step(X_mb, T_mb, X_hat_mb, T_hat_mb):
+        with tf.GradientTape() as tape:
+            y_logit_real, _ = discriminator(X_mb, T_mb)
+            y_logit_fake, _ = discriminator(X_hat_mb, T_hat_mb)
+            d_loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=y_logit_real, labels=tf.ones_like(y_logit_real)))
+            d_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=y_logit_fake, labels=tf.zeros_like(y_logit_fake)))
+            d_loss = d_loss_real + d_loss_fake
+        gradients = tape.gradient(d_loss, gru_layer.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, gru_layer.trainable_variables))
+        return d_loss
+
+    # Train/test division for both original and generated data
+    train_x, train_x_hat, test_x, test_x_hat, train_t, train_t_hat, test_t, test_t_hat = \
+        train_test_divide(ori_data, generated_data, ori_time, generated_time)
+
+    # Training loop
+    for itt in range(iterations):
+        # Batch setting
+        X_mb, T_mb = batch_generator(train_x, train_t, batch_size)
+        X_hat_mb, T_hat_mb = batch_generator(train_x_hat, train_t_hat, batch_size)
+        
+        # Train discriminator
+        step_d_loss = train_step(X_mb, T_mb, X_hat_mb, T_hat_mb)
+
+    # Test the performance on the testing set
+    y_pred_real_curr, y_pred_fake_curr = discriminator(test_x, test_t), discriminator(test_x_hat, test_t_hat)
+
+    y_pred_final = np.squeeze(np.concatenate((y_pred_real_curr[1].numpy(), y_pred_fake_curr[1].numpy()), axis=0))
+    y_label_final = np.concatenate((np.ones([len(y_pred_real_curr[1]),]), np.zeros([len(y_pred_fake_curr[1]),])), axis=0)
+
+    # Compute the accuracy
+    acc = accuracy_score(y_label_final, (y_pred_final > 0.5))
+    discriminative_score = np.abs(0.5 - acc)
+    
+    return discriminative_score
