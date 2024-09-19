@@ -1,0 +1,128 @@
+import argparse
+import os
+import torch
+from torchvision.utils import save_image
+import torch.nn.functional as F
+
+from improved_diffusion import gaussian_diffusion as gd
+from improved_diffusion.unet import UNetModel
+from improved_diffusion.script_util import create_gaussian_diffusion
+
+
+class DiffusionSampler:
+    def __init__(self, args):
+        self.args = args
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+
+        # 初始化模型
+        self.model = self._initialize_model()
+
+        # 加载模型权重，包括EMA权重
+        self.load_model(args.model_path)
+
+        # 初始化扩散过程
+        self.diffusion = create_gaussian_diffusion(
+            steps=args.diffusion_steps,
+            learn_sigma=args.learn_sigma,
+            noise_schedule=args.noise_schedule,
+            use_kl=args.use_kl,
+            rescale_timesteps=args.rescale_timesteps,
+        )
+
+    def _initialize_model(self):
+        """初始化模型"""
+        model = UNetModel(
+            in_channels=3,
+            model_channels=self.args.num_channels,
+            out_channels=3 if not self.args.learn_sigma else 6,
+            num_res_blocks=self.args.num_res_blocks,
+            attention_resolutions=tuple(map(int, self.args.attention_resolutions.split(","))),
+            dropout=self.args.dropout,
+            channel_mult=tuple(map(int, self.args.channel_mult.split(","))) if self.args.channel_mult else None,
+            use_checkpoint=self.args.use_checkpoint,
+            use_fp16=self.args.use_fp16,
+            num_heads=self.args.num_heads,
+            num_heads_upsample=self.args.num_heads_upsample,
+            use_scale_shift_norm=self.args.use_scale_shift_norm,
+        )
+        return model.to(self.device)
+
+    def load_model(self, model_path):
+        """加载EMA模型的权重"""
+        checkpoint = torch.load(model_path, map_location=self.device)
+        if 'ema_state_dicts' in checkpoint:
+            # 加载EMA模型参数
+            ema_state_dict = checkpoint['ema_state_dicts'][0]  # 这里假设只有一个 EMA rate
+            self.model.load_state_dict(ema_state_dict)
+            print(f"Loaded EMA model from {model_path}")
+        else:
+            # 回退到加载主模型的参数
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Loaded main model from {model_path}")
+
+    def sample_images(self, num_samples):
+        """使用扩散模型进行采样生成图像"""
+        self.model.eval()
+        with torch.no_grad():
+            for i in range(0, num_samples, self.args.batch_size):
+                current_batch_size = min(self.args.batch_size, num_samples - i)
+
+                # 从高斯噪声中采样
+                sample_shape = (current_batch_size, 3, self.args.image_size, self.args.image_size)
+                noise = torch.randn(sample_shape, device=self.device)
+
+                # 使用扩散模型采样生成图像
+                samples = self.diffusion.p_sample_loop(
+                    self.model,
+                    shape=sample_shape,
+                    noise=noise,
+                    clip_denoised=self.args.clip_denoised,
+                    device=self.device
+                )
+
+                # 将生成的图像保存为文件
+                for j in range(samples.size(0)):
+                    save_image((samples[j] + 1) / 2, os.path.join(self.args.save_dir, f"sample_{i + j:05d}.png"))
+
+                print(f"Saved images {i} to {i + current_batch_size}")
+
+
+def create_argparser():
+    """创建命令行参数解析器"""
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--model_path', type=str, required=True, help="Path to the model checkpoint")
+    parser.add_argument('--num_samples', type=int, default=64, help="Number of images to generate")
+    parser.add_argument('--batch_size', type=int, default=8, help="Batch size for sampling")
+    parser.add_argument('--image_size', type=int, default=64, help="Size of the generated images")
+    parser.add_argument('--diffusion_steps', type=int, default=1000, help="Number of diffusion steps")
+    parser.add_argument('--noise_schedule', type=str, default="linear", help="Noise schedule type (linear/cosine)")
+    parser.add_argument('--learn_sigma', action='store_true', help="Model learns variance")
+    parser.add_argument('--use_kl', action='store_true', help="Use kl loss")
+    parser.add_argument('--rescale_timesteps', action='store_true', help="Rescale timesteps")
+    parser.add_argument('--clip_denoised', action='store_true', help="Clip denoised samples to [-1, 1]")
+    parser.add_argument('--num_channels', type=int, default=128, help="Number of channels in the model")
+    parser.add_argument('--num_res_blocks', type=int, default=2, help="Number of residual blocks")
+    parser.add_argument('--dropout', type=float, default=0.1, help="Dropout rate")
+    parser.add_argument('--attention_resolutions', type=str, default="16,8", help="Comma-separated list of resolutions to use attention")
+    parser.add_argument('--channel_mult', type=str, default="", help="Channel multiplier")
+    parser.add_argument('--use_checkpoint', action='store_true', help="Use gradient checkpointing")
+    parser.add_argument('--use_fp16', action='store_true', help="Use mixed precision")
+    parser.add_argument('--num_heads', type=int, default=4, help="Number of attention heads")
+    parser.add_argument('--num_heads_upsample', type=int, default=-1, help="Number of attention heads for upsampling")
+    parser.add_argument('--use_scale_shift_norm', action='store_true', help="Use scale shift normalization")
+    parser.add_argument('--save_dir', type=str, default="./samples", help="Directory to save generated images")
+
+    return parser
+
+
+if __name__ == "__main__":
+    args = create_argparser().parse_args()
+
+    # 创建输出目录
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    # 创建采样器并开始采样
+    sampler = DiffusionSampler(args)
+    sampler.sample_images(args.num_samples)
