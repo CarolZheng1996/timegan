@@ -1,0 +1,219 @@
+import argparse
+import os
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from torchvision import datasets, transforms
+import copy
+
+from improved_diffusion import gaussian_diffusion as gd
+from improved_diffusion.unet import UNetModel
+from improved_diffusion.script_util import (
+    model_and_diffusion_defaults,
+    create_gaussian_diffusion,
+)
+
+
+class DiffusionTrainer:
+    def __init__(self, args):
+        self.args = args
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+
+        # 创建模型
+        self.model = self.create_model(args)
+        self.model.to(self.device)
+
+        # 创建模型参数列表
+        self.model_params = list(self.model.parameters())
+
+        # 创建 EMA 参数（多种 EMA rate 支持）
+        self.ema_rate = [args.ema_decay]  # 这里假设只有一个 ema_rate，您可以扩展为多个
+        self.ema_params = [copy.deepcopy(self.model_params) for _ in range(len(self.ema_rate))]
+
+        # 创建扩散过程
+        self.diffusion = create_gaussian_diffusion(
+            steps=args.diffusion_steps,
+            learn_sigma=args.learn_sigma,
+            noise_schedule=args.noise_schedule,
+            use_kl=args.use_kl,
+            rescale_timesteps=args.rescale_timesteps,
+        )
+
+        # 创建优化器
+        self.optimizer = AdamW(self.model_params, lr=args.lr)
+
+        # 创建学习率调度器
+        self.scheduler = None
+        if args.lr_anneal_steps > 0:
+            total_steps = args.lr_anneal_steps
+            self.scheduler = LambdaLR(self.optimizer, lr_lambda=lambda step: max(0, 1 - step / total_steps))
+
+        # 加载数据集
+        self.data_loader = self.load_data(args.data_dir, args.batch_size, args.image_size)
+
+    def create_model(self, args):
+        return UNetModel(
+            in_channels=3,
+            model_channels=args.num_channels,
+            out_channels=3 if not args.learn_sigma else 6,
+            num_res_blocks=args.num_res_blocks,
+            attention_resolutions=tuple(map(int, args.attention_resolutions.split(","))),
+            dropout=args.dropout,
+            channel_mult=tuple(map(int, args.channel_mult.split(","))) if args.channel_mult else None,
+            use_checkpoint=args.use_checkpoint,
+            use_fp16=args.use_fp16,
+            num_heads=args.num_heads,
+            num_heads_upsample=args.num_heads_upsample,
+            use_scale_shift_norm=args.use_scale_shift_norm,
+        )
+
+    def load_data(self, data_dir, batch_size, image_size):
+        transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5]),
+        ])
+        dataset = datasets.ImageFolder(data_dir, transform=transform)
+        data_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+        return data_loader
+
+    def update_ema(self):
+        """更新 EMA 参数"""
+        for ema_rate, ema_params in zip(self.ema_rate, self.ema_params):
+            for param, ema_param in zip(self.model_params, ema_params):
+                ema_param.data.mul_(ema_rate).add_(param.data, alpha=1 - ema_rate)
+
+    def save_model(self, save_dir, epoch):
+        """保存主模型和 EMA 模型的参数"""
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"model_epoch_{epoch}.pt")
+
+        # 保存主模型参数
+        model_state_dict = self.model.state_dict()
+
+        # 获取参数名称
+        param_names = [name for name, _ in self.model.named_parameters()]
+
+        # 保存 EMA 参数
+        ema_state_dicts = []
+        for ema_params in self.ema_params:
+            ema_state_dict = {}
+            for name, param in zip(param_names, ema_params):
+                ema_state_dict[name] = param.data.clone()
+            ema_state_dicts.append(ema_state_dict)
+
+        # 保存到文件
+        torch.save({
+            'model_state_dict': model_state_dict,
+            'ema_state_dicts': ema_state_dicts,
+            'epoch': epoch,
+        }, save_path)
+        print(f"Saved model checkpoint at {save_path}")
+
+    def load_model(self, load_path):
+        """加载模型和 EMA 参数"""
+        checkpoint = torch.load(load_path, map_location=self.device)
+        # 加载主模型参数
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        # 获取参数名称
+        param_names = [name for name, _ in self.model.named_parameters()]
+
+        # 加载 EMA 参数
+        ema_state_dicts = checkpoint['ema_state_dicts']
+        for ema_params, ema_state_dict in zip(self.ema_params, ema_state_dicts):
+            for param_name, ema_param in zip(param_names, ema_params):
+                ema_param.data.copy_(ema_state_dict[param_name])
+
+        # 恢复 epoch 等信息
+        self.current_epoch = checkpoint.get('epoch', 0)
+
+    def train(self):
+        step = 0
+        for epoch in range(self.args.epochs):
+            for i, (batch, _) in enumerate(self.data_loader):
+                batch = batch.to(self.device)
+                self.optimizer.zero_grad()
+
+                # 随机采样时间步 t
+                t = torch.randint(0, self.diffusion.num_timesteps, (batch.size(0),), device=self.device).long()
+
+                # 添加噪声
+                noise = torch.randn_like(batch)
+                noisy_images = self.diffusion.q_sample(x_start=batch, t=t, noise=noise)
+
+                # 预测噪声
+                noise_pred = self.model(noisy_images, t)
+
+                # 计算损失
+                loss = nn.MSELoss()(noise_pred, noise)
+
+                loss.backward()
+                self.optimizer.step()
+
+                # 更新 EMA 参数
+                self.update_ema()
+
+                # 更新学习率调度器
+                if self.scheduler is not None:
+                    self.scheduler.step()
+
+                step += 1
+
+                if i % self.args.log_interval == 0:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    print(f"Epoch {epoch}, Step {i}, Loss: {loss.item()}, LR: {current_lr}")
+
+                # 如果达到最大训练步数，提前停止
+                if self.args.lr_anneal_steps > 0 and step >= self.args.lr_anneal_steps:
+                    print("Reached maximum training steps.")
+                    return
+
+            # 每个 epoch 后保存模型
+            self.save_model(self.args.model_save_dir, epoch)
+
+
+def create_argparser():
+    defaults = dict(
+        data_dir="",
+        model_save_dir="./checkpoints",
+        epochs=10,
+        lr=1e-4,
+        batch_size=16,
+        image_size=64,
+        diffusion_steps=1000,
+        noise_schedule="linear",
+        num_channels=128,
+        num_res_blocks=2,
+        channel_mult="",
+        learn_sigma=False,
+        use_kl=False,
+        rescale_timesteps=False,
+        use_checkpoint=False,
+        attention_resolutions="16,8",
+        num_heads=4,
+        num_heads_upsample=-1,
+        use_scale_shift_norm=True,
+        dropout=0.1,
+        use_fp16=False,
+        log_interval=10,
+        ema_decay=0.9999,       # EMA 衰减率
+        lr_anneal_steps=0,      # 学习率退火步数，0 表示不使用
+    )
+    parser = argparse.ArgumentParser()
+    for k, v in defaults.items():
+        arg_type = type(v) if v is not None else str
+        if isinstance(v, bool):
+            parser.add_argument(f"--{k}", default=v, action='store_true' if not v else 'store_false')
+        else:
+            parser.add_argument(f"--{k}", type=arg_type, default=v)
+    return parser
+
+
+if __name__ == "__main__":
+    args = create_argparser().parse_args()
+    trainer = DiffusionTrainer(args)
+    trainer.train()
